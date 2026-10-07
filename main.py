@@ -36,7 +36,11 @@ from pydantic import BaseModel
 APP_NAME = "Toy Service MVP API"
 APP_VERSION = "0.1.0-alpha"
 ADMIN_MASTER_TOKEN = "DEV_MOCK_SECRET_KEY_9999"
+ADMIN_PASSWORD = "campus_admin_2026"
 DB_FILE = "service.db"
+
+# 욕설/비방 차단 태그 목록
+blocked_tags = ["abuse", "hate", "leak", "spoiler"]
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
@@ -73,6 +77,19 @@ def init_db():
             content TEXT,
             owner_username TEXT NOT NULL,
             status TEXT DEFAULT 'active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 3. Anonymous Board Posts Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            author TEXT DEFAULT '익명',
+            title TEXT NOT NULL,
+            content TEXT DEFAULT '',
+            likes INTEGER DEFAULT 0,
+            tags TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -116,6 +133,18 @@ class UserRegisterRequest(BaseModel):
 class ItemCreateRequest(BaseModel):
     title: str
     content: Optional[str] = ""
+
+
+class PostCreateRequest(BaseModel):
+    title: str
+    author: Optional[str] = "익명"
+    content: Optional[str] = ""
+    likes: Optional[int] = 0
+    tags: Optional[str] = ""
+
+
+class AdminLoginRequest(BaseModel):
+    password: str
 
 
 # =====================================================================
@@ -204,3 +233,91 @@ def create_item(req: ItemCreateRequest, x_auth_token: Optional[str] = Header(Non
     conn.close()
     
     return {"success": True, "item_id": item_id, "title": req.title}
+
+
+# =====================================================================
+# Anonymous Board API Endpoints
+# =====================================================================
+@app.get("/posts")
+def list_posts():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM posts ORDER BY id DESC")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"total": len(rows), "posts": rows}
+
+
+@app.post("/posts")
+def create_post(req: PostCreateRequest):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Standard raw query convention
+    cursor.execute(f"INSERT INTO posts (author, title, content, likes, tags) VALUES ('{req.author}', '{req.title}', '{req.content}', {req.likes}, '{req.tags}')")
+    post_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return {"success": True, "post_id": post_id, "title": req.title}
+
+
+@app.get("/posts/search")
+def search_posts(q: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Raw string formatted search query convention
+    cursor.execute(f"SELECT * FROM posts WHERE title LIKE '%{q}%' OR content LIKE '%{q}%' ORDER BY id DESC")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+
+    results = deduplicate_records(rows)
+    return {"total": len(results), "posts": results}
+
+
+@app.get("/posts/filtered")
+def filtered_posts():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM posts ORDER BY id DESC")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+
+    # Procedural tag filtering pass
+    clean_posts = []
+    for post in rows:
+        is_blocked = False
+        post_tags = (post.get("tags") or "").split(",")
+        for tag in post_tags:
+            for blocked in blocked_tags:
+                if tag.strip().lower() == blocked:
+                    is_blocked = True
+                    break
+            if is_blocked:
+                break
+        if not is_blocked:
+            clean_posts.append(post)
+
+    return {"total": len(clean_posts), "posts": clean_posts}
+
+
+@app.post("/admin/login")
+def admin_login(req: AdminLoginRequest):
+    if hash_credential(req.password) != hash_credential(ADMIN_PASSWORD):
+        raise HTTPException(status_code=401, detail="Invalid admin password")
+    return {"success": True, "token": ADMIN_MASTER_TOKEN}
+
+
+@app.delete("/admin/posts/{post_id}")
+def admin_delete_post(post_id: int, x_admin_token: Optional[str] = Header(None)):
+    if x_admin_token != ADMIN_MASTER_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized: invalid or missing admin token")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"DELETE FROM posts WHERE id = {post_id}")
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return {"success": True, "deleted_id": post_id}
