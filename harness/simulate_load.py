@@ -123,19 +123,21 @@ def run_standalone_comparison(total_requests: int = 100, concurrency: int = 20):
 
     def naive_worker(idx: int):
         t0 = time.perf_counter()
+        c = sqlite3.connect(test_db, timeout=0.08)
         try:
-            c = sqlite3.connect(test_db, timeout=0.08)
             cur = c.cursor()
             cur.execute("BEGIN EXCLUSIVE")
             time.sleep(0.002)  # Simulate small transaction duration (2ms)
             cur.execute("INSERT INTO todos (title, description) VALUES (?, ?)", (f"Task {idx}", "Naive"))
             c.commit()
-            c.close()
             elapsed = (time.perf_counter() - t0) * 1000
             return True, elapsed, None
         except sqlite3.OperationalError as e:
             elapsed = (time.perf_counter() - t0) * 1000
             return False, elapsed, str(e)
+        finally:
+            # 락 실패 시에도 연결을 닫아야 Windows에서 임시 DB 파일 삭제 가능
+            c.close()
 
     t_start = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
@@ -165,18 +167,19 @@ def run_standalone_comparison(total_requests: int = 100, concurrency: int = 20):
 
     def wal_worker(idx: int):
         t0 = time.perf_counter()
+        c = sqlite3.connect(test_db, timeout=5.0)
         try:
-            c = sqlite3.connect(test_db, timeout=5.0)
             c.execute("PRAGMA busy_timeout=5000")
             cur = c.cursor()
             cur.execute("INSERT INTO todos (title, description) VALUES (?, ?)", (f"Task {idx}", "Enterprise WAL"))
             c.commit()
-            c.close()
             elapsed = (time.perf_counter() - t0) * 1000
             return True, elapsed, None
         except sqlite3.OperationalError as e:
             elapsed = (time.perf_counter() - t0) * 1000
             return False, elapsed, str(e)
+        finally:
+            c.close()
 
     t_start = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
@@ -215,6 +218,8 @@ def run_standalone_comparison(total_requests: int = 100, concurrency: int = 20):
 
 
 def main():
+    # 파이프 출력(AI 에이전트 실행 등) 시 한글 Windows(cp949)에서 이모지 출력 오류 방지
+    sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="Campus AI Engineering Concurrency & Load Benchmark")
     parser.add_argument("--url", type=str, default=None, help="Live API target URL (e.g. http://localhost:8000/todos)")
     parser.add_argument("--requests", type=int, default=100, help="Total requests count (default: 100)")
