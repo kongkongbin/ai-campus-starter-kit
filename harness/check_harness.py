@@ -114,7 +114,13 @@ def stage2_unit_tests() -> list:
         print("  \033[1;33m⚠️ Stage 2 SKIP: tests/ 디렉토리에 테스트 파일이 없습니다. (단위 테스트 추가 권장)\033[0m")
         return failures
 
-    res = subprocess.run(["python3", "-m", "pytest", test_dirs[0], "-v", "--tb=short"], capture_output=True, text=True)
+    # sys.executable: 하네스를 실행한 인터프리터(venv)로 테스트 실행 (Windows의 python3 스텁 회피)
+    # 테스트 출력을 UTF-8로 고정해 한글 Windows(cp949)에서도 디코딩 오류 없이 수집
+    child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", test_dirs[0], "-v", "--tb=short"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", env=child_env,
+    )
     if res.returncode == 0:
         print("  \033[1;32m✅ Stage 2 PASS: 모든 단위/통합 테스트 100% 통과\033[0m")
     else:
@@ -173,6 +179,8 @@ def stage3_performance_benchmark() -> list:
 
 
 def main():
+    # 파이프 출력(AI 에이전트 실행 등) 시 한글 Windows(cp949)에서 이모지 출력 오류 방지
+    sys.stdout.reconfigure(encoding="utf-8")
     print_header("Campus Harness Verification Engine")
     
     sec_issues = stage1_security_audit()
