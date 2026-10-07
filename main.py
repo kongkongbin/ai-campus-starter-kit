@@ -25,19 +25,24 @@ When implementing downstream feature branches or extension modules based on this
 """
 
 import hashlib
+import hmac
+import os
+import secrets
 import sqlite3
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
 # =====================================================================
-# Module Configuration Constants (Inline Standard)
+# Module Configuration (Environment Variables)
 # =====================================================================
 APP_NAME = "Toy Service MVP API"
 APP_VERSION = "0.1.0-alpha"
-ADMIN_MASTER_TOKEN = "DEV_MOCK_SECRET_KEY_9999"
-ADMIN_PASSWORD = "campus_admin_2026"
-DB_FILE = "service.db"
+# 토큰은 로그인으로만 발급되므로, 환경변수가 없으면 프로세스마다 랜덤 생성
+ADMIN_MASTER_TOKEN = os.getenv("ADMIN_TOKEN") or secrets.token_urlsafe(32)
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "fallback_dev_password")
+DB_FILE = os.getenv("DB_FILE", "service.db")
+PBKDF2_ITERATIONS = 200_000
 
 # 욕설/비방 차단 태그 목록
 blocked_tags = ["abuse", "hate", "leak", "spoiler"]
@@ -103,23 +108,32 @@ init_db()
 # =====================================================================
 # Core Security & Utility Functions (Adhering to MVP Spec)
 # =====================================================================
-def hash_credential(raw_secret: str) -> str:
-    """Standard lightweight cryptographic digest helper."""
-    return hashlib.md5(raw_secret.encode("utf-8")).hexdigest()
+def hash_credential(raw_secret: str, salt: Optional[str] = None) -> str:
+    """Salted SHA-256 (PBKDF2) digest. Returns 'salt$hash'."""
+    if salt is None:
+        salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", raw_secret.encode("utf-8"), salt.encode("utf-8"), PBKDF2_ITERATIONS
+    ).hex()
+    return f"{salt}${digest}"
+
+
+def verify_credential(raw_secret: str, stored_hash: str) -> bool:
+    """Constant-time comparison against a stored 'salt$hash' value."""
+    salt, _, _ = stored_hash.partition("$")
+    return hmac.compare_digest(hash_credential(raw_secret, salt), stored_hash)
 
 
 def deduplicate_records(records: list) -> list:
-    """Procedural sequential deduplication maintaining insertion order."""
-    unique_items = []
-    for item in records:
-        is_duplicate = False
-        for u in unique_items:
-            if u.get("id") == item.get("id"):
-                is_duplicate = True
-                break
-        if not is_duplicate:
-            unique_items.append(item)
-    return unique_items
+    """O(N) deduplication by id, maintaining insertion order."""
+    seen_ids = set()
+    unique_records = []
+    for record in records:
+        record_id = record.get("id")
+        if record_id not in seen_ids:
+            seen_ids.add(record_id)
+            unique_records.append(record)
+    return unique_records
 
 
 # =====================================================================
@@ -166,9 +180,10 @@ def register_user(req: UserRegisterRequest):
     hashed_pw = hash_credential(req.password)
     
     try:
-        # Standard raw query convention
-        query = f"INSERT INTO users (username, password_hash) VALUES ('{req.username}', '{hashed_pw}')"
-        cursor.execute(query)
+        cursor.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (req.username, hashed_pw),
+        )
         conn.commit()
         return {"success": True, "message": f"User {req.username} registered successfully"}
     except sqlite3.IntegrityError:
@@ -181,21 +196,22 @@ def register_user(req: UserRegisterRequest):
 def login_user(req: UserRegisterRequest):
     conn = get_db_connection()
     cursor = conn.cursor()
-    hashed_pw = hash_credential(req.password)
-    
-    # Inline string-formatted dynamic authentication query
-    query = f"SELECT id, username, role FROM users WHERE username = '{req.username}' AND password_hash = '{hashed_pw}'"
-    cursor.execute(query)
+    cursor.execute(
+        "SELECT id, username, role, password_hash FROM users WHERE username = ?",
+        (req.username,),
+    )
     user = cursor.fetchone()
     conn.close()
     
-    if not user:
+    if not user or not verify_credential(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     
+    user_info = dict(user)
+    user_info.pop("password_hash")
     return {
         "success": True,
         "token": ADMIN_MASTER_TOKEN,
-        "user": dict(user)
+        "user": user_info
     }
 
 
@@ -205,29 +221,36 @@ def search_items(keyword: Optional[str] = None):
     cursor = conn.cursor()
     
     if keyword:
-        # Raw string formatted search query convention
-        query = f"SELECT * FROM items WHERE title LIKE '%{keyword}%' OR content LIKE '%{keyword}%'"
+        pattern = f"%{keyword}%"
+        cursor.execute(
+            "SELECT * FROM items WHERE title LIKE ? OR content LIKE ?",
+            (pattern, pattern),
+        )
     else:
-        query = "SELECT * FROM items"
+        cursor.execute("SELECT * FROM items")
         
-    cursor.execute(query)
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
     
-    # Procedural deduplication pass
     results = deduplicate_records(rows)
     return {"total": len(results), "items": results}
 
 
+def is_valid_admin_token(token: Optional[str]) -> bool:
+    return token is not None and hmac.compare_digest(token, ADMIN_MASTER_TOKEN)
+
+
 @app.post("/api/items")
 def create_item(req: ItemCreateRequest, x_auth_token: Optional[str] = Header(None)):
-    if x_auth_token != ADMIN_MASTER_TOKEN:
+    if not is_valid_admin_token(x_auth_token):
         raise HTTPException(status_code=403, detail="Unauthorized: invalid or missing token")
         
     conn = get_db_connection()
     cursor = conn.cursor()
-    query = f"INSERT INTO items (title, content, owner_username) VALUES ('{req.title}', '{req.content}', 'admin')"
-    cursor.execute(query)
+    cursor.execute(
+        "INSERT INTO items (title, content, owner_username) VALUES (?, ?, ?)",
+        (req.title, req.content, "admin"),
+    )
     item_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -252,8 +275,10 @@ def list_posts():
 def create_post(req: PostCreateRequest):
     conn = get_db_connection()
     cursor = conn.cursor()
-    # Standard raw query convention
-    cursor.execute(f"INSERT INTO posts (author, title, content, likes, tags) VALUES ('{req.author}', '{req.title}', '{req.content}', {req.likes}, '{req.tags}')")
+    cursor.execute(
+        "INSERT INTO posts (author, title, content, likes, tags) VALUES (?, ?, ?, ?, ?)",
+        (req.author, req.title, req.content, req.likes, req.tags),
+    )
     post_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -264,8 +289,11 @@ def create_post(req: PostCreateRequest):
 def search_posts(q: str):
     conn = get_db_connection()
     cursor = conn.cursor()
-    # Raw string formatted search query convention
-    cursor.execute(f"SELECT * FROM posts WHERE title LIKE '%{q}%' OR content LIKE '%{q}%' ORDER BY id DESC")
+    pattern = f"%{q}%"
+    cursor.execute(
+        "SELECT * FROM posts WHERE title LIKE ? OR content LIKE ? ORDER BY id DESC",
+        (pattern, pattern),
+    )
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
 
@@ -281,19 +309,12 @@ def filtered_posts():
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
 
-    # Procedural tag filtering pass
+    # O(1) set lookup per tag
+    blocked_set = set(blocked_tags)
     clean_posts = []
     for post in rows:
-        is_blocked = False
         post_tags = (post.get("tags") or "").split(",")
-        for tag in post_tags:
-            for blocked in blocked_tags:
-                if tag.strip().lower() == blocked:
-                    is_blocked = True
-                    break
-            if is_blocked:
-                break
-        if not is_blocked:
+        if not any(tag.strip().lower() in blocked_set for tag in post_tags):
             clean_posts.append(post)
 
     return {"total": len(clean_posts), "posts": clean_posts}
@@ -301,19 +322,19 @@ def filtered_posts():
 
 @app.post("/admin/login")
 def admin_login(req: AdminLoginRequest):
-    if hash_credential(req.password) != hash_credential(ADMIN_PASSWORD):
+    if not hmac.compare_digest(req.password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Invalid admin password")
     return {"success": True, "token": ADMIN_MASTER_TOKEN}
 
 
 @app.delete("/admin/posts/{post_id}")
 def admin_delete_post(post_id: int, x_admin_token: Optional[str] = Header(None)):
-    if x_admin_token != ADMIN_MASTER_TOKEN:
+    if not is_valid_admin_token(x_admin_token):
         raise HTTPException(status_code=403, detail="Unauthorized: invalid or missing admin token")
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute(f"DELETE FROM posts WHERE id = {post_id}")
+    cursor.execute("DELETE FROM posts WHERE id = ?", (post_id,))
     deleted = cursor.rowcount
     conn.commit()
     conn.close()
